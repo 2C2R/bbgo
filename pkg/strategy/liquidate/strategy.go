@@ -116,6 +116,12 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		quantity = baseBalance.Available
 	}
 
+	// Check min quantity
+	if quantity.Compare(s.Market.MinQuantity) < 0 {
+		log.Infof("%s is less than %s market min quantity %s, skipping", quantity.String(), s.Symbol, s.Market.MinQuantity.String())
+		return nil
+	}
+
 	if s.DryRun {
 		log.Infof("[DryRun] would submit order: Symbol=%s Side=%s Type=%s Price=%s Quantity=%s TimeInForce=%s",
 			s.Symbol, side, types.OrderTypeLimitMaker, price.String(), quantity.String(), types.TimeInForceGTC)
