@@ -57,7 +57,7 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 	// Determine which balance and price to use based on trading direction
 	var price fixedpoint.Value
 
-	// 1. Calculate price first
+	// Calculate price first
 	if side == types.SideTypeBuy {
 		priceVolume, ok := ob.BestBid()
 		if !ok {
@@ -89,7 +89,7 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		}
 	}
 
-	// Cancel existing orders if price is different
+	// Cancel existing orders if any
 	if activeOrders.NumOfOrders() > 0 {
 		if err := s.orderExecutor.GracefulCancel(ctx); err != nil {
 			log.WithError(err).Errorf("cannot cancel orders")
@@ -98,7 +98,7 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		log.Infof("cancelled active orders")
 	}
 
-	// 2. Calculate quantity using latest balance
+	// Calculate quantity using latest balance
 	balances := s.session.GetAccount().Balances()
 	var quantity fixedpoint.Value
 
