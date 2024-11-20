@@ -22,19 +22,19 @@ func init() {
 }
 
 type Strategy struct {
-	Symbol          string           `json:"symbol"`
-	Side            string           `json:"side"`
-	PriceType       types.PriceType  `json:"priceType"`
-	UpdateInterval  types.Duration   `json:"updateInterval"`
-	OffsetTick      int              `json:"offsetTick"`
-	MinQuoteBalance fixedpoint.Value `json:"minQuoteBalance"`
-	DryRun          bool             `json:"dryRun"`
+	Symbol         string         `json:"symbol"`
+	Side           string         `json:"side"`
+	UpdateInterval types.Duration `json:"updateInterval"`
+	OffsetTick     int            `json:"offsetTick"`
+	DryRun         bool           `json:"dryRun"`
 
 	Market   types.Market
-	Position *types.Position `json:"-"`
+	Position *types.Position
 
-	session       *bbgo.ExchangeSession
-	orderExecutor *bbgo.GeneralOrderExecutor
+	session        *bbgo.ExchangeSession
+	orderExecutor  *bbgo.GeneralOrderExecutor
+	orderBook      *types.StreamOrderBook
+	lastUpdateTime time.Time
 }
 
 func (s *Strategy) ID() string {
@@ -42,7 +42,7 @@ func (s *Strategy) ID() string {
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
-	// No need to subscribe any data
+	session.Subscribe(types.BookChannel, s.Symbol, types.SubscribeOptions{})
 }
 
 func (s *Strategy) placeOrder(ctx context.Context) error {
@@ -52,79 +52,68 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		side = types.SideTypeSell
 	}
 
-	// Get account balances
-	balances := s.session.GetAccount().Balances()
-
-	// Get latest ticker
-	ticker, err := s.session.Exchange.QueryTicker(ctx, s.Symbol)
-	if err != nil {
-		return err
-	}
-
+	// Get price from orderbook instead of ticker
+	ob := s.orderBook.Copy()
 	// Determine which balance and price to use based on trading direction
-	var quantity fixedpoint.Value
 	var price fixedpoint.Value
 
+	// 1. Calculate price first
 	if side == types.SideTypeBuy {
-		// Use quote currency balance for BUY
-		quoteBalance, ok := balances[s.Market.QuoteCurrency]
+		priceVolume, ok := ob.BestBid()
 		if !ok {
-			return fmt.Errorf("quote balance %s not found", s.Market.QuoteCurrency)
+			return fmt.Errorf("best bid not found")
 		}
-
-		if quoteBalance.Available.Compare(s.MinQuoteBalance) <= 0 {
-			return fmt.Errorf("quote balance %s less than min balance %s",
-				quoteBalance.Available.String(), s.MinQuoteBalance.String())
-		}
-
-		// Get buy price
-		price = s.PriceType.GetPrice(ticker, side)
+		price = priceVolume.Price
+		log.Infof("best bid: %s", price.String())
 		if s.OffsetTick > 0 {
 			price = price.Sub(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
-
-		// Calculate buy quantity = available balance / current price
-		quantity = quoteBalance.Available.Div(price)
-
 	} else {
-		// Use base currency balance for SELL
-		baseBalance, ok := balances[s.Market.BaseCurrency]
+		priceVolume, ok := ob.BestAsk()
 		if !ok {
-			return fmt.Errorf("base balance %s not found", s.Market.BaseCurrency)
+			return fmt.Errorf("best ask not found")
 		}
-		quantity = baseBalance.Available
-
-		// Get sell price
-		price = s.PriceType.GetPrice(ticker, side)
+		price = priceVolume.Price
+		log.Infof("best ask: %s", price.String())
 		if s.OffsetTick > 0 {
 			price = price.Add(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
 	}
 
-	// Check quantity is greater than min quantity
-	if quantity.Compare(s.Market.MinQuantity) < 0 {
-		return fmt.Errorf("quantity %s is less than min quantity %s",
-			quantity.String(), s.Market.MinQuantity.String())
-	}
-
-	// Check if there are existing orders with the same price
+	// Check if we already have active orders at the same price
 	activeOrders := s.orderExecutor.ActiveMakerOrders()
-	for _, o := range activeOrders.Orders() {
-		if o.Price.Compare(price) == 0 {
-			log.Infof("skip placing order: existing order found at price %s", price.String())
+	for _, order := range activeOrders.Orders() {
+		if order.Price.Compare(price) == 0 {
+			log.Infof("existing order found at price %s, skipping", price.String())
 			return nil
 		}
 	}
 
-	// Cancel existing orders with a delay to ensure they are cancelled
-	if err := s.orderExecutor.GracefulCancel(ctx); err != nil {
-		log.WithError(err).Errorf("cannot cancel orders")
-		return err
+	// Cancel existing orders if price is different
+	if activeOrders.NumOfOrders() > 0 {
+		if err := s.orderExecutor.GracefulCancel(ctx); err != nil {
+			log.WithError(err).Errorf("cannot cancel orders")
+			return err
+		}
+		log.Infof("cancelled active orders")
 	}
 
-	// Verify no active orders remain
-	if s.orderExecutor.ActiveMakerOrders().NumOfOrders() > 0 {
-		return fmt.Errorf("there are still active orders that could not be cancelled")
+	// 2. Calculate quantity using latest balance
+	balances := s.session.GetAccount().Balances()
+	var quantity fixedpoint.Value
+
+	if side == types.SideTypeBuy {
+		quoteBalance, ok := balances[s.Market.QuoteCurrency]
+		if !ok {
+			return fmt.Errorf("quote balance %s not found", s.Market.QuoteCurrency)
+		}
+		quantity = quoteBalance.Available.Div(price)
+	} else {
+		baseBalance, ok := balances[s.Market.BaseCurrency]
+		if !ok {
+			return fmt.Errorf("base balance %s not found", s.Market.BaseCurrency)
+		}
+		quantity = baseBalance.Available
 	}
 
 	if s.DryRun {
@@ -133,7 +122,6 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		return nil
 	}
 
-	// Submit limit maker order
 	createdOrders, err := s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
 		Symbol:      s.Symbol,
 		Side:        side,
@@ -147,7 +135,7 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		return err
 	}
 
-	log.Infof("created orders: %+v", createdOrders)
+	log.Infof("order submitted: %+v", createdOrders)
 	return nil
 }
 
@@ -157,6 +145,8 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		s.Position = types.NewPosition(s.Symbol, s.Market.BaseCurrency, s.Market.QuoteCurrency)
 	}
 	s.orderExecutor = bbgo.NewGeneralOrderExecutor(session, s.Symbol, ID, "", s.Position)
+	s.orderBook = types.NewStreamBook(s.Symbol, session.Exchange.Name())
+	s.orderBook.BindStream(session.MarketDataStream)
 
 	// Get market info
 	market, ok := session.Market(s.Symbol)
@@ -165,23 +155,16 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	}
 	s.Market = market
 
-	// Set default values
-	if s.UpdateInterval == 0 {
-		s.UpdateInterval = types.Duration(time.Second * 5)
-	}
-	if s.PriceType == "" {
-		s.PriceType = types.PriceTypeMaker
-	}
-
-	// Wait for user data stream to be ready
-	session.UserDataStream.OnStart(func() {
+	// Listen to orderbook updates
+	s.orderBook.OnUpdate(func(book types.SliceOrderBook) {
+		if time.Since(s.lastUpdateTime) < s.UpdateInterval.Duration() {
+			return
+		}
+		s.lastUpdateTime = time.Now()
 		if err := s.placeOrder(ctx); err != nil {
 			log.WithError(err).Error("cannot place order")
 		}
 	})
-
-	ticker := time.NewTicker(s.UpdateInterval.Duration())
-	defer ticker.Stop()
 
 	// the shutdown handler, you can cancel all orders
 	bbgo.OnShutdown(ctx, func(ctx context.Context, wg *sync.WaitGroup) {
@@ -190,15 +173,5 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		bbgo.Sync(ctx, s)
 	})
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-
-		case <-ticker.C:
-			if err := s.placeOrder(ctx); err != nil {
-				log.WithError(err).Error("cannot place order")
-			}
-		}
-	}
+	return nil
 }
