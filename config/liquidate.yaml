@@ -1,0 +1,13 @@
+---
+exchangeStrategies:
+- on: max
+  liquidate:
+    # symbol: USDTTWD
+    symbol: MAXTWD
+    side: SELL           # SELL or BUY
+    priceType: MAKER     # MAKER, LAST, BID, ASK
+    updateInterval: 5s   # Duration string, e.g., 5s, 1m, 1h
+    offsetTick: 10000       # Number of ticks to offset from the price
+    # minQuoteBalance: 8.0 # Minimum quote balance required for BUY orders
+    minQuoteBalance: 20.0
+    dryRun: false         # Set to false to actually execute orders
