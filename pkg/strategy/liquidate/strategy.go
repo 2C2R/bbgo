@@ -1,8 +1,9 @@
-package liquidated
+package liquidate
 
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -29,10 +30,11 @@ type Strategy struct {
 	MinQuoteBalance fixedpoint.Value `json:"minQuoteBalance"`
 	DryRun          bool             `json:"dryRun"`
 
-	Market types.Market
+	Market   types.Market
+	Position *types.Position `json:"-"`
 
-	orderExecutor *bbgo.GeneralOrderExecutor
 	session       *bbgo.ExchangeSession
+	orderExecutor *bbgo.GeneralOrderExecutor
 }
 
 func (s *Strategy) ID() string {
@@ -40,31 +42,31 @@ func (s *Strategy) ID() string {
 }
 
 func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
-	// 不需要訂閱任何資料
+	// No need to subscribe any data
 }
 
 func (s *Strategy) placeOrder(ctx context.Context) error {
-	// 檢查交易方向
+	// Check trading direction
 	side := types.SideTypeBuy
 	if s.Side == "SELL" {
 		side = types.SideTypeSell
 	}
 
-	// 取得帳戶餘額
+	// Get account balances
 	balances := s.session.GetAccount().Balances()
 
-	// 取得最新報價
+	// Get latest ticker
 	ticker, err := s.session.Exchange.QueryTicker(ctx, s.Symbol)
 	if err != nil {
 		return err
 	}
 
-	// 根據交易方向決定要用哪個餘額與價格
+	// Determine which balance and price to use based on trading direction
 	var quantity fixedpoint.Value
 	var price fixedpoint.Value
 
 	if side == types.SideTypeBuy {
-		// 買入時用 quote currency 餘額
+		// Use quote currency balance for BUY
 		quoteBalance, ok := balances[s.Market.QuoteCurrency]
 		if !ok {
 			return fmt.Errorf("quote balance %s not found", s.Market.QuoteCurrency)
@@ -75,39 +77,54 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 				quoteBalance.Available.String(), s.MinQuoteBalance.String())
 		}
 
-		// 取得買入價格
+		// Get buy price
 		price = s.PriceType.GetPrice(ticker, side)
 		if s.OffsetTick > 0 {
 			price = price.Sub(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
 
-		// 計算可買入數量 = 可用餘額 / 當前價格
+		// Calculate buy quantity = available balance / current price
 		quantity = quoteBalance.Available.Div(price)
 
 	} else {
-		// 賣出時用 base currency 餘額
+		// Use base currency balance for SELL
 		baseBalance, ok := balances[s.Market.BaseCurrency]
 		if !ok {
 			return fmt.Errorf("base balance %s not found", s.Market.BaseCurrency)
 		}
 		quantity = baseBalance.Available
 
-		// 取得賣出價格
+		// Get sell price
 		price = s.PriceType.GetPrice(ticker, side)
 		if s.OffsetTick > 0 {
 			price = price.Add(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
 	}
 
-	// 檢查數量是否符合最小交易量
+	// Check quantity is greater than min quantity
 	if quantity.Compare(s.Market.MinQuantity) < 0 {
 		return fmt.Errorf("quantity %s is less than min quantity %s",
 			quantity.String(), s.Market.MinQuantity.String())
 	}
 
-	// 先取消之前的掛單
+	// Check if there are existing orders with the same price
+	activeOrders := s.orderExecutor.ActiveMakerOrders()
+	for _, o := range activeOrders.Orders() {
+		if o.Price.Compare(price) == 0 {
+			log.Infof("skip placing order: existing order found at price %s", price.String())
+			return nil
+		}
+	}
+
+	// Cancel existing orders with a delay to ensure they are cancelled
 	if err := s.orderExecutor.GracefulCancel(ctx); err != nil {
 		log.WithError(err).Errorf("cannot cancel orders")
+		return err
+	}
+
+	// Verify no active orders remain
+	if s.orderExecutor.ActiveMakerOrders().NumOfOrders() > 0 {
+		return fmt.Errorf("there are still active orders that could not be cancelled")
 	}
 
 	if s.DryRun {
@@ -116,7 +133,7 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		return nil
 	}
 
-	// 送出限價掛單
+	// Submit limit maker order
 	createdOrders, err := s.orderExecutor.SubmitOrders(ctx, types.SubmitOrder{
 		Symbol:      s.Symbol,
 		Side:        side,
@@ -134,17 +151,21 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 	return nil
 }
 
-func (s *Strategy) Run(ctx context.Context, orderExecutor *bbgo.GeneralOrderExecutor, session *bbgo.ExchangeSession) error {
-	s.orderExecutor = orderExecutor
+func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
 	s.session = session
+	if s.Position == nil {
+		s.Position = types.NewPosition(s.Symbol, s.Market.BaseCurrency, s.Market.QuoteCurrency)
+	}
+	s.orderExecutor = bbgo.NewGeneralOrderExecutor(session, s.Symbol, ID, "", s.Position)
 
+	// Get market info
 	market, ok := session.Market(s.Symbol)
 	if !ok {
 		return fmt.Errorf("market %s not found", s.Symbol)
 	}
 	s.Market = market
 
-	// 設定預設值
+	// Set default values
 	if s.UpdateInterval == 0 {
 		s.UpdateInterval = types.Duration(time.Second * 5)
 	}
@@ -152,15 +173,23 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor *bbgo.GeneralOrderExec
 		s.PriceType = types.PriceTypeMaker
 	}
 
+	// Wait for user data stream to be ready
+	session.UserDataStream.OnStart(func() {
+		if err := s.placeOrder(ctx); err != nil {
+			log.WithError(err).Error("cannot place order")
+		}
+	})
+
 	ticker := time.NewTicker(s.UpdateInterval.Duration())
 	defer ticker.Stop()
 
-	// 先執行一次
-	if err := s.placeOrder(ctx); err != nil {
-		log.WithError(err).Error("cannot place order")
-	}
+	// the shutdown handler, you can cancel all orders
+	bbgo.OnShutdown(ctx, func(ctx context.Context, wg *sync.WaitGroup) {
+		defer wg.Done()
+		_ = s.orderExecutor.GracefulCancel(ctx)
+		bbgo.Sync(ctx, s)
+	})
 
-	// 定時檢查並更新掛單
 	for {
 		select {
 		case <-ctx.Done():
