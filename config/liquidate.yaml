@@ -5,5 +5,5 @@ exchangeStrategies:
       symbol: USDTTWD
       side: SELL         # SELL or BUY
       updateInterval: 5s # Duration string, e.g., 5s, 1m, 1h
-      offsetTick: 0  # Number of ticks to offset from the price
+      offsetTick: 0     # Number of ticks to offset from the price
       dryRun: false      # Set to false to actually execute orders
