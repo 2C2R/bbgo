@@ -1,0 +1,6 @@
+exchangeStrategies:
+- on: max  # or any other supported exchange
+  withdrawmarket:
+    symbol: "USDTTWD" # the trading pair you want to monitor
+    minWithdrawAmount: 100 # the minimum amount to withdraw
+    dryRun: false # set to false for real withdrawals
