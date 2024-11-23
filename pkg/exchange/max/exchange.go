@@ -573,6 +573,18 @@ func (e *Exchange) Withdraw(
 	ctx context.Context, asset string, amount fixedpoint.Value, address string, options *types.WithdrawalOptions,
 ) error {
 	asset = toLocalCurrency(asset)
+	if asset == "twd" {
+		response, err := e.client.WithdrawalService.NewWithdrawalRequest().
+			Currency(asset).
+			Amount(amount.Float64()).
+			AddressUUID("ignore-this-param").
+			Do(ctx)
+		if err != nil {
+			return err
+		}
+		log.Infof("withdrawal request response: %+v", response)
+		return nil
+	}
 
 	addresses, err := e.client.WithdrawalService.NewGetWithdrawalAddressesRequest().
 		Currency(asset).

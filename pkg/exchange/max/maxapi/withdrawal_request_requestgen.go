@@ -161,6 +161,14 @@ func (w *WithdrawalRequest) Do(ctx context.Context) (*Withdraw, error) {
 
 	apiURL := "v2/withdrawal"
 
+	if w.currency == "twd" {
+		// TWD withdrawal is handled by a different endpoint
+		apiURL = "v2/withdrawal/twd"
+		// Remove the params that are not needed for TWD withdrawal (Only amount is needed)
+		delete(params, "withdraw_address_uuid")
+		delete(params, "currency")
+	}
+
 	req, err := w.client.NewAuthenticatedRequest(ctx, "POST", apiURL, query, params)
 	if err != nil {
 		return nil, err
