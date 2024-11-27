@@ -70,9 +70,11 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		if bestBid.Price.Sub(bestAsk.Price).Compare(s.Market.TickSize) > 0 {
 			price = bestBid.Price.Sub(s.Market.TickSize)
 			log.Infof("best bid %s - 1 tick > best ask %s, submit new best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
-		} else {
+		} else if bestBid.Price.Sub(s.Market.TickSize).Compare(bestAsk.Price) == 0 {
 			price = bestBid.Price
-			log.Infof("best bid %s - 1 tick <= best ask %s, submit current best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
+			log.Infof("best bid %s - 1 tick == best ask %s, submit current best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
+		} else {
+			return fmt.Errorf("malformed orderbook, best bid %s - 1 tick < best ask %s", bestBid.Price.String(), bestAsk.Price.String())
 		}
 		if s.OffsetTick > 0 {
 			price = price.Sub(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
@@ -91,9 +93,11 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		if bestAsk.Price.Sub(s.Market.TickSize) > bestBid.Price {
 			price = bestAsk.Price.Sub(s.Market.TickSize)
 			log.Infof("best ask %s - 1 tick > best bid %s, submit new best ask price: %s", bestAsk.Price.String(), bestBid.Price.String(), price.String())
-		} else {
+		} else if bestAsk.Price.Sub(s.Market.TickSize).Compare(bestBid.Price) == 0 {
 			price = bestAsk.Price
-			log.Infof("best ask %s - 1 tick <= best bid %s, submit current best ask price: %s", bestAsk.Price.String(), bestBid.Price.String(), price.String())
+			log.Infof("best ask %s - 1 tick == best bid %s, submit current best ask price: %s", bestAsk.Price.String(), bestBid.Price.String(), price.String())
+		} else {
+			return fmt.Errorf("malformed orderbook, best ask %s - 1 tick < best bid %s", bestAsk.Price.String(), bestBid.Price.String())
 		}
 		if s.OffsetTick > 0 {
 			price = price.Add(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
