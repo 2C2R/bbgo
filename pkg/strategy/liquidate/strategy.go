@@ -59,22 +59,42 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 
 	// Calculate price first
 	if side == types.SideTypeBuy {
-		priceVolume, ok := ob.BestBid()
+		bestBid, ok := ob.BestBid()
 		if !ok {
 			return fmt.Errorf("best bid not found")
 		}
-		price = priceVolume.Price
-		log.Infof("best bid: %s", price.String())
+		bestAsk, ok := ob.BestAsk()
+		if !ok {
+			return fmt.Errorf("best ask not found")
+		}
+		if bestBid.Price.Sub(bestAsk.Price).Compare(s.Market.TickSize) > 0 {
+			price = bestBid.Price.Sub(s.Market.TickSize)
+			log.Infof("best bid %s - 1 tick > best ask %s, submit new best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
+		} else {
+			price = bestBid.Price
+			log.Infof("best bid %s - 1 tick <= best ask %s, submit current best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
+		}
 		if s.OffsetTick > 0 {
 			price = price.Sub(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
 	} else {
-		priceVolume, ok := ob.BestAsk()
+		bestAsk, ok := ob.BestAsk()
 		if !ok {
 			return fmt.Errorf("best ask not found")
 		}
-		price = priceVolume.Price
-		log.Infof("best ask: %s", price.String())
+		bestBid, ok := ob.BestBid()
+		if !ok {
+			return fmt.Errorf("best bid not found")
+		}
+		log.Infof("best bid: %s, best ask: %s", bestBid.Price.String(), bestAsk.Price.String())
+		// If best ask sub 1 tick size is greater than best bid, use best ask sub 1 tick size to make sure we can sell first
+		if bestAsk.Price.Sub(s.Market.TickSize) > bestBid.Price {
+			price = bestAsk.Price.Sub(s.Market.TickSize)
+			log.Infof("best ask %s - 1 tick > best bid %s, submit new best ask price: %s", bestAsk.Price.String(), bestBid.Price.String(), price.String())
+		} else {
+			price = bestAsk.Price
+			log.Infof("best ask %s - 1 tick <= best bid %s, submit current best ask price: %s", bestAsk.Price.String(), bestBid.Price.String(), price.String())
+		}
 		if s.OffsetTick > 0 {
 			price = price.Add(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
