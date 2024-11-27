@@ -71,7 +71,7 @@ func (s *Strategy) handleBalanceUpdate(balanceMap types.BalanceMap) {
 	baseBalance := balanceMap[s.Market.BaseCurrency]
 	logrus.Infof("base balance: %v", baseBalance)
 	if baseBalance.Available.Compare(s.Market.MinQuantity) > 0 {
-		log.Infof("balance %s is greater than min quantiry %s, please wait for the order to be filled", baseBalance.Available, s.Market.MinAmount)
+		log.Infof("balance %s is greater than min quantity %s, please wait for the order to be filled", baseBalance.Available, s.Market.MinQuantity)
 		return
 	}
 
