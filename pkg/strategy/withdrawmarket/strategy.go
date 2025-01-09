@@ -3,6 +3,7 @@ package withdrawmarket
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -66,6 +67,8 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 }
 
 func (s *Strategy) handleBalanceUpdate(balanceMap types.BalanceMap) {
+	// FIXME: this is a temporary fix to avoid balance stuck issue
+	time.Sleep(10 * time.Second)
 	ctx := context.Background()
 	// Check if the base balance is greater than the min amount
 	baseBalance := balanceMap[s.Market.BaseCurrency]
