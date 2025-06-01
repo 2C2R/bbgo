@@ -29,6 +29,8 @@ type Strategy struct {
 	MinWithdrawAmount fixedpoint.Value `json:"minWithdrawAmount"`
 	// DryRun is a flag to indicate if the strategy is running in dry run mode
 	DryRun bool `json:"dryRun"`
+	// BalanceFinalizationDelay is the duration to wait for balance to be finalized
+	BalanceFinalizationDelay time.Duration `json:"balanceFinalizationDelay"`
 
 	// Market stores the market configuration of the symbol
 	Market types.Market
@@ -39,6 +41,11 @@ type Strategy struct {
 	session *bbgo.ExchangeSession
 	// orderExecutor is the exchange order executor
 	orderExecutor *bbgo.GeneralOrderExecutor
+
+	// isPendingWithdrawal indicates if the strategy is waiting for balance finalization
+	isPendingWithdrawal bool
+	// pendingWithdrawalSince stores the time when the strategy entered pending withdrawal state
+	pendingWithdrawalSince time.Time
 }
 
 func (s *Strategy) ID() string {
@@ -61,20 +68,65 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	}
 	s.Market = market
 
+	if s.BalanceFinalizationDelay <= 0 {
+		s.BalanceFinalizationDelay = 3 * time.Minute
+		log.Infof("BalanceFinalizationDelay not set or invalid, using default: %v", s.BalanceFinalizationDelay)
+	}
+
 	// Subscribe to balance updates
 	session.UserDataStream.OnBalanceUpdate(s.handleBalanceUpdate)
 	return nil
 }
 
 func (s *Strategy) handleBalanceUpdate(balanceMap types.BalanceMap) {
-	// FIXME: this is a temporary fix to avoid balance stuck issue
-	time.Sleep(10 * time.Second)
 	ctx := context.Background()
+
+	// Check for open orders first
+	service, ok := s.session.Exchange.(types.ExchangeTradeService)
+	if !ok {
+		log.Errorf("exchange %s does not implement order query service", s.session.ExchangeName)
+		s.isPendingWithdrawal = false // Reset pending state if service is not available
+		return
+	}
+	orders, err := service.QueryOpenOrders(ctx, s.Symbol)
+	if err != nil {
+		log.Errorf("failed to query orders: %v", err)
+		s.isPendingWithdrawal = false // Reset pending state on error
+		return
+	}
+
+	if len(orders) > 0 {
+		if s.isPendingWithdrawal {
+			log.Info("open orders detected, cancelling pending withdraw check")
+			s.isPendingWithdrawal = false
+		}
+		return
+	}
+
+	// No open orders
+	if !s.isPendingWithdrawal {
+		log.Infof("no open orders detected. Entering pending withdrawal state for %s. Will check balance after %v.", s.Symbol, s.BalanceFinalizationDelay)
+		s.isPendingWithdrawal = true
+		s.pendingWithdrawalSince = time.Now()
+		return
+	}
+
+	// Currently in pending withdrawal state
+	if time.Since(s.pendingWithdrawalSince) < s.BalanceFinalizationDelay {
+		// log.Debugf("still waiting for balance finalization for %s...", s.Symbol) // Optional: for debugging
+		return
+	}
+
+	log.Infof("pending withdrawal delay for %s has passed. Checking balances now.", s.Symbol)
+	// Reset pending state, actual check will happen now.
+	// If withdrawal happens, great. If not, it will re-enter pending state if conditions (no open orders) are met again.
+	s.isPendingWithdrawal = false
+
 	// Check if the base balance is greater than the min amount
 	baseBalance := balanceMap[s.Market.BaseCurrency]
 	logrus.Infof("base balance: %v", baseBalance)
 	if baseBalance.Available.Compare(s.Market.MinQuantity) > 0 {
-		log.Infof("balance %s is greater than min quantity %s, please wait for the order to be filled", baseBalance.Available, s.Market.MinQuantity)
+		log.Infof("base currency balance %s (%s) is greater than min quantity %s, please wait for the order to be filled or manually manage.", baseBalance.Available, s.Market.BaseCurrency, s.Market.MinQuantity)
 		return
 	}
 
@@ -83,26 +135,11 @@ func (s *Strategy) handleBalanceUpdate(balanceMap types.BalanceMap) {
 	logrus.Infof("quote balance: %v", quoteBalance)
 
 	if quoteBalance.Available.Compare(s.MinWithdrawAmount) < 0 {
-		log.Infof("balance %s is less than min withdraw amount %s, skipping withdraw", quoteBalance.Available, s.MinWithdrawAmount)
+		log.Infof("quote currency balance %s (%s) is less than min withdraw amount %s, skipping withdraw.", quoteBalance.Available, s.Market.QuoteCurrency, s.MinWithdrawAmount)
 		return
 	}
 
-	// Check for open orders first
-	service, ok := s.session.Exchange.(types.ExchangeTradeService)
-	if !ok {
-		log.Errorf("exchange %s does not implement order query service", s.session.ExchangeName)
-		return
-	}
-	orders, err := service.QueryOpenOrders(ctx, s.Symbol)
-	if err != nil {
-		log.Errorf("failed to query orders: %v", err)
-		return
-	}
-	if orders != nil {
-		log.Info("there are still open orders, skipping withdraw check")
-		return
-	}
-
+	log.Infof("conditions met for withdrawal for %s. Proceeding to submit.", s.Symbol)
 	if err := s.submitWithdraw(ctx, balanceMap); err != nil {
 		log.Errorf("failed to submit withdraw: %v", err)
 	}
