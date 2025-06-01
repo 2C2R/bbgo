@@ -3,7 +3,8 @@ exchangeStrategies:
   - on: max
     liquidate:
       symbol: USDTTWD
-      side: SELL         # SELL or BUY
-      updateInterval: 5s # Duration string, e.g., 5s, 1m, 1h
-      offsetTick: 0      # Number of ticks to offset from the price
-      dryRun: false      # Set to false to actually execute orders
+      side: SELL                   # SELL or BUY
+      updateInterval: 10m          # Duration string, e.g., 5s, 1m, 1h
+      offsetTick: 0                # Number of ticks to offset from the price
+      dryRun: false                # Set to false to actually execute orders
+      maxPriceDropPercentage: 0.01 # e.g., 0.01 for 1%
