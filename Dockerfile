@@ -18,11 +18,7 @@ RUN go get github.com/mattn/go-sqlite3
 RUN go build -o $GOPATH_ORIG/bin/bbgo ./cmd/bbgo
 
 # Second stage container
-<<<<<<< HEAD
 FROM alpine:3.20
-=======
-FROM alpine:3
->>>>>>> 2d42a297a (feat: add withdraw TWD stategy)
 
 # Create the default user 'bbgo' and assign to env 'USER'
 ENV USER=bbgo
