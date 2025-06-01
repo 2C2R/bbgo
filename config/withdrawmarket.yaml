@@ -3,4 +3,5 @@ exchangeStrategies:
   withdrawmarket:
     symbol: "USDTTWD" # the trading pair you want to monitor
     minWithdrawAmount: 100 # the minimum amount to withdraw
+    balanceFinalizationDelay: 3m # the duration to wait for balance to be finalized
     dryRun: false # set to false for real withdrawals
