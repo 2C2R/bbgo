@@ -30,7 +30,7 @@ type Strategy struct {
 	// DryRun is a flag to indicate if the strategy is running in dry run mode
 	DryRun bool `json:"dryRun"`
 	// BalanceFinalizationDelay is the duration to wait for balance to be finalized
-	BalanceFinalizationDelay time.Duration `json:"balanceFinalizationDelay"`
+	BalanceFinalizationDelay types.Duration `json:"balanceFinalizationDelay"`
 
 	// Market stores the market configuration of the symbol
 	Market types.Market
@@ -69,8 +69,8 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	s.Market = market
 
 	if s.BalanceFinalizationDelay <= 0 {
-		s.BalanceFinalizationDelay = 3 * time.Minute
-		log.Infof("BalanceFinalizationDelay not set or invalid, using default: %v", s.BalanceFinalizationDelay)
+		s.BalanceFinalizationDelay = types.Duration(3 * time.Minute)
+		log.Infof("BalanceFinalizationDelay is not set, using default: %v", s.BalanceFinalizationDelay)
 	}
 
 	// Subscribe to balance updates
@@ -105,14 +105,14 @@ func (s *Strategy) handleBalanceUpdate(balanceMap types.BalanceMap) {
 
 	// No open orders
 	if !s.isPendingWithdrawal {
-		log.Infof("no open orders detected. Entering pending withdrawal state for %s. Will check balance after %v.", s.Symbol, s.BalanceFinalizationDelay)
+		log.Infof("no open orders detected. Entering pending withdrawal state for %s. Will check balance after %v.", s.Symbol, s.BalanceFinalizationDelay.Duration())
 		s.isPendingWithdrawal = true
 		s.pendingWithdrawalSince = time.Now()
 		return
 	}
 
 	// Currently in pending withdrawal state
-	if time.Since(s.pendingWithdrawalSince) < s.BalanceFinalizationDelay {
+	if time.Since(s.pendingWithdrawalSince) < s.BalanceFinalizationDelay.Duration() {
 		// log.Debugf("still waiting for balance finalization for %s...", s.Symbol) // Optional: for debugging
 		return
 	}
