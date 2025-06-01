@@ -67,15 +67,33 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		if !ok {
 			return fmt.Errorf("best ask not found")
 		}
-		if bestBid.Price.Sub(bestAsk.Price).Compare(s.Market.TickSize) > 0 {
-			price = bestBid.Price.Sub(s.Market.TickSize)
-			log.Infof("best bid %s - 1 tick > best ask %s, submit new best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
-		} else if bestBid.Price.Sub(s.Market.TickSize).Compare(bestAsk.Price) == 0 {
+
+		// Revised buy-side logic:
+		// Try to place a buy order at a price slightly higher than the current best bid,
+		// but still lower than the best ask, to become the new best bid.
+		if bestBid.Price.Add(s.Market.TickSize).Compare(bestAsk.Price) < 0 {
+			// If best_bid + 1 tick is still less than best_ask, we can place our order at best_bid + 1 tick.
+			price = bestBid.Price.Add(s.Market.TickSize)
+			log.Infof("best bid %s + 1 tick < best ask %s, submit new best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
+		} else if bestBid.Price.Add(s.Market.TickSize).Compare(bestAsk.Price) == 0 {
+			// If best_bid + 1 tick is equal to best_ask, we place our order at current best_bid to avoid crossing the spread.
+			// Or, if the spread is already 1 tick (best_ask - best_bid == tick_size), placing at best_bid is appropriate.
 			price = bestBid.Price
-			log.Infof("best bid %s - 1 tick == best ask %s, submit current best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
+			log.Infof("best bid %s + 1 tick >= best ask %s (or spread is 1 tick), submit current best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
 		} else {
-			return fmt.Errorf("malformed orderbook, best bid %s - 1 tick < best ask %s", bestBid.Price.String(), bestAsk.Price.String())
+			// This case implies bestBid.Price.Add(s.Market.TickSize).Compare(bestAsk.Price) > 0
+			// which means best_bid + 1 tick > best_ask. This should not happen in a typical healthy order book
+			// unless the spread is zero or negative (crossed book).
+			// Or, it could mean the market is very thin and placing a more aggressive order is not desired by this logic.
+			// We can choose to place at bestBid if it's not worse than bestAsk.
+			if bestBid.Price.Compare(bestAsk.Price) < 0 {
+				price = bestBid.Price
+				log.Infof("best bid + 1 tick > best ask. Spread is very small or crossed. Submitting at current best bid price: %s", price.String())
+			} else {
+				return fmt.Errorf("malformed orderbook or unable to place buy order without crossing spread: best bid %s, best ask %s", bestBid.Price.String(), bestAsk.Price.String())
+			}
 		}
+
 		if s.OffsetTick > 0 {
 			price = price.Sub(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
