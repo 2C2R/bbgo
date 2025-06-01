@@ -22,19 +22,22 @@ func init() {
 }
 
 type Strategy struct {
-	Symbol         string         `json:"symbol"`
-	Side           string         `json:"side"`
-	UpdateInterval types.Duration `json:"updateInterval"`
-	OffsetTick     int            `json:"offsetTick"`
-	DryRun         bool           `json:"dryRun"`
+	Symbol                 string         `json:"symbol"`
+	Side                   string         `json:"side"`
+	UpdateInterval         types.Duration `json:"updateInterval"`
+	OffsetTick             int            `json:"offsetTick"`
+	DryRun                 bool           `json:"dryRun"`
+	MaxPriceDropPercentage float64        `json:"maxPriceDropPercentage"` // e.g., 0.02 for 2%
 
 	Market   types.Market
 	Position *types.Position
 
-	session        *bbgo.ExchangeSession
-	orderExecutor  *bbgo.GeneralOrderExecutor
-	orderBook      *types.StreamOrderBook
-	lastUpdateTime time.Time
+	session                 *bbgo.ExchangeSession
+	orderExecutor           *bbgo.GeneralOrderExecutor
+	orderBook               *types.StreamOrderBook
+	lastUpdateTime          time.Time
+	lastCalculatedSellPrice fixedpoint.Value // Stores the last sell price that passed the drop check
+	maxPriceDropF           fixedpoint.Value // Parsed MaxPriceDropPercentage as fixedpoint
 }
 
 func (s *Strategy) ID() string {
@@ -120,6 +123,28 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 		if s.OffsetTick > 0 {
 			price = price.Add(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
+
+		// Price Drop Check for SELL orders
+		if !s.maxPriceDropF.IsZero() { // Check if feature is enabled
+			if !s.lastCalculatedSellPrice.IsZero() { // If we have a previous price to compare against
+				allowedDrop := s.lastCalculatedSellPrice.Mul(s.maxPriceDropF)
+				minimumAcceptablePrice := s.lastCalculatedSellPrice.Sub(allowedDrop)
+
+				if price.Compare(minimumAcceptablePrice) < 0 {
+					log.Warnf("[%s] SELL price %s is %.2f%% below last known good price %s (min acceptable %s). Skipping order this cycle.",
+						s.Symbol, price.String(), s.MaxPriceDropPercentage*100, s.lastCalculatedSellPrice.String(), minimumAcceptablePrice.String())
+					return nil // Skip placing order this cycle
+				}
+				// Price is acceptable, update lastCalculatedSellPrice with the current price
+				s.lastCalculatedSellPrice = price
+				log.Debugf("[%s] SELL price %s passed drop check. Updated lastCalculatedSellPrice.", s.Symbol, price.String())
+			} else {
+				// This is the first sell price calculation with the check enabled.
+				// So, use the current price as the baseline.
+				s.lastCalculatedSellPrice = price
+				log.Infof("[%s] Initialized lastCalculatedSellPrice for SELL to %s (price drop check enabled).", s.Symbol, price.String())
+			}
+		}
 	}
 
 	// Check if we already have active orders at the same price
@@ -202,6 +227,15 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		return fmt.Errorf("market %s not found", s.Symbol)
 	}
 	s.Market = market
+
+	// Initialize MaxPriceDropPercentage fixedpoint value
+	if s.MaxPriceDropPercentage > 0 && s.MaxPriceDropPercentage < 1.0 { // Basic validation e.g. 0.01 for 1%, 0.99 for 99%
+		s.maxPriceDropF = fixedpoint.NewFromFloat(s.MaxPriceDropPercentage)
+		log.Infof("[%s] Price drop check enabled for SELL side with max drop of %.2f%%", s.Symbol, s.MaxPriceDropPercentage*100)
+	} else if s.MaxPriceDropPercentage != 0 { // if it's 0, it's disabled (which is fine). Otherwise, it's an invalid value.
+		log.Warnf("[%s] MaxPriceDropPercentage %.2f is invalid. It should be between 0.0 (exclusive, for enabling) and 1.0 (exclusive). Disabling price drop check.", s.Symbol, s.MaxPriceDropPercentage)
+		s.maxPriceDropF = fixedpoint.Zero // Ensure it's zero, effectively disabling it
+	}
 
 	// Listen to orderbook updates
 	s.orderBook.OnUpdate(func(book types.SliceOrderBook) {
