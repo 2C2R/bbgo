@@ -46,6 +46,8 @@ type Strategy struct {
 	isPendingWithdrawal bool
 	// pendingWithdrawalSince stores the time when the strategy entered pending withdrawal state
 	pendingWithdrawalSince time.Time
+	// withdrawalCheckTimer is used to wake up the strategy to check for withdrawal conditions
+	withdrawalCheckTimer *time.Timer
 }
 
 func (s *Strategy) ID() string {
@@ -75,11 +77,26 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 
 	// Subscribe to balance updates
 	session.UserDataStream.OnBalanceUpdate(s.handleBalanceUpdate)
+
+	// Perform an initial check to engage timer logic if conditions are met at startup.
+	log.Infof("Performing initial balance check for %s on startup.", s.Symbol)
+	initialBalances, err := s.session.Exchange.QueryAccountBalances(context.Background())
+	if err != nil {
+		log.Errorf("Error fetching initial balances for %s: %v. Will rely on subsequent balance updates.", s.Symbol, err)
+	} else {
+		s.handleBalanceUpdate(initialBalances)
+	}
 	return nil
 }
 
 func (s *Strategy) handleBalanceUpdate(balanceMap types.BalanceMap) {
 	ctx := context.Background()
+
+	// If a timer is active, stop it. We are processing now, either due to a real update or the timer firing.
+	if s.withdrawalCheckTimer != nil {
+		s.withdrawalCheckTimer.Stop()
+		s.withdrawalCheckTimer = nil
+	}
 
 	// Check for open orders first
 	service, ok := s.session.Exchange.(types.ExchangeTradeService)
@@ -100,42 +117,96 @@ func (s *Strategy) handleBalanceUpdate(balanceMap types.BalanceMap) {
 			log.Info("open orders detected, cancelling pending withdraw check")
 			s.isPendingWithdrawal = false
 		}
-		return
+		return // No timer needed if there are open orders.
 	}
 
-	// No open orders
+	// No open orders. Manage pending state and timer.
 	if !s.isPendingWithdrawal {
+		// Not currently pending: Enter pending state and set a timer for the full delay.
 		log.Infof("no open orders detected. Entering pending withdrawal state for %s. Will check balance after %v.", s.Symbol, s.BalanceFinalizationDelay.Duration())
 		s.isPendingWithdrawal = true
 		s.pendingWithdrawalSince = time.Now()
-		return
+
+		s.withdrawalCheckTimer = time.AfterFunc(s.BalanceFinalizationDelay.Duration(), func() {
+			log.Infof("Withdrawal check timer fired for %s. Fetching current balances and re-evaluating.", s.Symbol)
+			currentBalances, err := s.session.Exchange.QueryAccountBalances(context.Background())
+			if err != nil {
+				log.Errorf("Error fetching balances in timer callback for %s: %v. Scheduling one retry.", s.Symbol, err)
+				// Retry once after a short delay.
+				s.withdrawalCheckTimer = time.AfterFunc(1*time.Minute, func() {
+					log.Infof("Retrying withdrawal check for %s after timer fetch error.", s.Symbol)
+					retryBalances, errRetry := s.session.Exchange.QueryAccountBalances(context.Background())
+					if errRetry != nil {
+						log.Errorf("Error fetching balances on retry in timer for %s: %v. Resetting pending state.", s.Symbol, errRetry)
+						s.isPendingWithdrawal = false // Give up on timer path if retry fails
+						return
+					}
+					s.handleBalanceUpdate(retryBalances)
+				})
+				return
+			}
+			s.handleBalanceUpdate(currentBalances)
+		})
+		return // Return after setting up the timer.
 	}
 
-	// Currently in pending withdrawal state
+	// If we reach here, s.isPendingWithdrawal is true.
+	// This means either a real balance update occurred while pending, or a previous timer fired and called us.
 	if time.Since(s.pendingWithdrawalSince) < s.BalanceFinalizationDelay.Duration() {
-		// log.Debugf("still waiting for balance finalization for %s...", s.Symbol) // Optional: for debugging
-		return
+		// Delay has NOT passed. We are in pending state.
+		// A timer was stopped at the beginning. We need to set a new timer for the *remaining* duration.
+		remainingDelay := s.BalanceFinalizationDelay.Duration() - time.Since(s.pendingWithdrawalSince)
+
+		if remainingDelay > 0 {
+			log.Debugf("Still waiting for balance finalization for %s. %v remaining. Re-scheduling check.", s.Symbol, remainingDelay)
+			s.withdrawalCheckTimer = time.AfterFunc(remainingDelay, func() {
+				log.Infof("Withdrawal check timer (re-scheduled) fired for %s. Fetching current balances and re-evaluating.", s.Symbol)
+				currentBalances, err := s.session.Exchange.QueryAccountBalances(context.Background())
+				if err != nil {
+					log.Errorf("Error fetching balances in re-scheduled timer callback for %s: %v. Scheduling one retry.", s.Symbol, err)
+					// Retry once after a short delay.
+					s.withdrawalCheckTimer = time.AfterFunc(1*time.Minute, func() {
+						log.Infof("Retrying withdrawal check for %s after re-scheduled timer fetch error.", s.Symbol)
+						retryBalances, errRetry := s.session.Exchange.QueryAccountBalances(context.Background())
+						if errRetry != nil {
+							log.Errorf("Error fetching balances on retry in re-scheduled timer for %s: %v. Resetting pending state.", s.Symbol, errRetry)
+							s.isPendingWithdrawal = false
+							return
+						}
+						s.handleBalanceUpdate(retryBalances)
+					})
+					return
+				}
+				s.handleBalanceUpdate(currentBalances)
+			})
+			return // Return as we've re-scheduled the timer for the remaining duration.
+		}
+		// If remainingDelay <= 0, it means time is effectively up. Fall through to proceed with the check.
+		log.Debugf("Remaining delay for %s is zero or negative (%v). Proceeding to check.", s.Symbol, remainingDelay)
 	}
 
+	// ---- Delay has passed ----
+	// This block is reached if:
+	// 1. s.isPendingWithdrawal was true, AND
+	// 2. time.Since(s.pendingWithdrawalSince) >= s.BalanceFinalizationDelay.Duration()
+	//    (either directly, or because remainingDelay was <= 0 in the block above)
 	log.Infof("pending withdrawal delay for %s has passed. Checking balances now.", s.Symbol)
-	// Reset pending state, actual check will happen now.
-	// If withdrawal happens, great. If not, it will re-enter pending state if conditions (no open orders) are met again.
-	s.isPendingWithdrawal = false
+	s.isPendingWithdrawal = false // Reset pending state as we are now performing the check.
 
 	// Check if the base balance is greater than the min amount
 	baseBalance := balanceMap[s.Market.BaseCurrency]
-	logrus.Infof("base balance: %v", baseBalance)
+	log.Infof("base balance: %s", baseBalance.Available.String())
 	if baseBalance.Available.Compare(s.Market.MinQuantity) > 0 {
-		log.Infof("base currency balance %s (%s) is greater than min quantity %s, please wait for the order to be filled or manually manage.", baseBalance.Available, s.Market.BaseCurrency, s.Market.MinQuantity)
+		log.Infof("base currency balance %s (%s) is greater than min quantity %s, please wait for the order to be filled or manually manage.", baseBalance.Available.String(), s.Market.BaseCurrency, s.Market.MinQuantity.String())
 		return
 	}
 
 	// Withdraw the available quote balance
 	quoteBalance := balanceMap[s.Market.QuoteCurrency]
-	logrus.Infof("quote balance: %v", quoteBalance)
+	log.Infof("quote balance: %s", quoteBalance.Available.String())
 
 	if quoteBalance.Available.Compare(s.MinWithdrawAmount) < 0 {
-		log.Infof("quote currency balance %s (%s) is less than min withdraw amount %s, skipping withdraw.", quoteBalance.Available, s.Market.QuoteCurrency, s.MinWithdrawAmount)
+		log.Infof("quote currency balance %s (%s) is less than min withdraw amount %s, skipping withdraw.", quoteBalance.Available.String(), s.Market.QuoteCurrency, s.MinWithdrawAmount.String())
 		return
 	}
 
