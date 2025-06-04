@@ -80,16 +80,13 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 			price = bestBid.Price.Add(s.Market.TickSize)
 			log.Infof("best bid %s + 1 tick < best ask %s, submit new best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
 		} else if bestBid.Price.Add(s.Market.TickSize).Compare(bestAsk.Price) == 0 {
-			// If best_bid + 1 tick is equal to best_ask, we place our order at current best_bid to avoid crossing the spread.
-			// Or, if the spread is already 1 tick (best_ask - best_bid == tick_size), placing at best_bid is appropriate.
+			// If best_bid + 1 tick is equal to best_ask (spread is 1 tick),
+			// we place our order at current best_bid to avoid crossing the spread and act as a maker.
 			price = bestBid.Price
-			log.Infof("best bid %s + 1 tick >= best ask %s (or spread is 1 tick), submit current best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
+			log.Infof("best bid %s + 1 tick == best ask %s (spread is 1 tick), submit current best bid price: %s", bestBid.Price.String(), bestAsk.Price.String(), price.String())
 		} else {
 			// This case implies bestBid.Price.Add(s.Market.TickSize).Compare(bestAsk.Price) > 0
-			// which means best_bid + 1 tick > best_ask. This should not happen in a typical healthy order book
-			// unless the spread is zero or negative (crossed book).
-			// Or, it could mean the market is very thin and placing a more aggressive order is not desired by this logic.
-			// We can choose to place at bestBid if it's not worse than bestAsk.
+			// which means best_bid + 1 tick > best_ask. This can happen with very small positive spreads or crossed books.
 			if bestBid.Price.Compare(bestAsk.Price) < 0 {
 				price = bestBid.Price
 				log.Infof("best bid + 1 tick > best ask. Spread is very small or crossed. Submitting at current best bid price: %s", price.String())
@@ -111,16 +108,38 @@ func (s *Strategy) placeOrder(ctx context.Context) error {
 			return fmt.Errorf("best bid not found")
 		}
 		log.Infof("best bid: %s, best ask: %s", bestBid.Price.String(), bestAsk.Price.String())
-		// If best ask sub 1 tick size is greater than best bid, use best ask sub 1 tick size to make sure we can sell first
-		if bestAsk.Price.Sub(s.Market.TickSize) > bestBid.Price {
-			price = bestAsk.Price.Sub(s.Market.TickSize)
-			log.Infof("best ask %s - 1 tick > best bid %s, submit new best ask price: %s", bestAsk.Price.String(), bestBid.Price.String(), price.String())
-		} else if bestAsk.Price.Sub(s.Market.TickSize).Compare(bestBid.Price) == 0 {
-			price = bestAsk.Price
-			log.Infof("best ask %s - 1 tick == best bid %s, submit current best ask price: %s", bestAsk.Price.String(), bestBid.Price.String(), price.String())
+
+		// Sell-side: aim to be the best ask or a competitive one.
+		// Our ideal price is one tick better (lower) than the current best ask, if possible.
+		potentialPriceToUndercut := bestAsk.Price.Sub(s.Market.TickSize)
+
+		if potentialPriceToUndercut.Compare(bestBid.Price) > 0 {
+			// If (bestAsk - TickSize) is still greater than bestBid,
+			// we can become the new, better best ask.
+			price = potentialPriceToUndercut
+			log.Infof("Submitting new best ask: %s (bestAsk %s - TickSize %s > bestBid %s)",
+				price.String(), bestAsk.Price.String(), s.Market.TickSize.String(), bestBid.Price.String())
 		} else {
-			return fmt.Errorf("malformed orderbook, best ask %s - 1 tick < best bid %s", bestAsk.Price.String(), bestBid.Price.String())
+			// This means (bestAsk - TickSize) <= bestBid.
+			// This occurs if:
+			// 1. Spread is 1 tick: (bestAsk - TickSize) == bestBid.
+			// 2. Spread is < 1 tick (but > 0): (bestAsk - TickSize) < bestBid, but bestAsk > bestBid.
+			// 3. Spread is 0 or negative: bestAsk <= bestBid.
+
+			// In cases 1 and 2, we should place at bestAsk.Price to be a maker and not cross the bid.
+			// In case 3, the book is problematic.
+			if bestAsk.Price.Compare(bestBid.Price) > 0 {
+				// Spread is > 0 (could be 1 tick or < 1 tick). Place at current bestAsk.
+				price = bestAsk.Price
+				log.Infof("Spread too tight to undercut best ask. Submitting at current best ask: %s ( (bestAsk %s - TickSize %s) <= bestBid %s, and current bestAsk %s > bestBid %s)",
+					price.String(), bestAsk.Price.String(), s.Market.TickSize.String(), bestBid.Price.String(), bestAsk.Price.String(), bestBid.Price.String())
+			} else {
+				// Spread is 0 or negative (bestAsk <= bestBid).
+				return fmt.Errorf("malformed orderbook or unable to place sell order without crossing: best ask %s, best bid %s",
+					bestAsk.Price.String(), bestBid.Price.String())
+			}
 		}
+
 		if s.OffsetTick > 0 {
 			price = price.Add(s.Market.TickSize.Mul(fixedpoint.NewFromInt(int64(s.OffsetTick))))
 		}
@@ -302,28 +321,48 @@ func (s *Strategy) handleBalanceUpdate(ctx context.Context, updatedBalances type
 		relevantCurrency = s.Market.BaseCurrency
 	}
 
-	newBalance, ok := updatedBalances[relevantCurrency]
-	if !ok {
-		// log.Debugf("[%s] Balance update received, but relevant currency %s not found in the update.", s.Symbol, relevantCurrency)
-		// We should still update our knowledge of other balances if they affect overall account state.
-		// However, for triggering based on a specific currency deposit, we only care about that one.
-		// Let's re-fetch the full balances to update our lastKnownRelevantBalance accurately.
-		currentBalances := s.session.GetAccount().Balances()
-		if currentRelBalance, ok := currentBalances[relevantCurrency]; ok {
-			s.lastKnownRelevantBalance = currentRelBalance.Available
+	previousKnownBalance := s.lastKnownRelevantBalance // Capture the balance state before this update handling
+
+	var currentAvailableBalance fixedpoint.Value
+	var balanceSource string // For logging: "delta update" or "full fetch"
+	foundRelevantBalanceInUpdate := false
+
+	if newBalance, ok := updatedBalances[relevantCurrency]; ok {
+		// Relevant currency is in the specific update event
+		currentAvailableBalance = newBalance.Available
+		balanceSource = "delta update"
+		foundRelevantBalanceInUpdate = true
+		log.Infof("[%s] Balance update for %s (from %s): New Available: %s. Old Known (before this event): %s",
+			s.Symbol, relevantCurrency, balanceSource, currentAvailableBalance.String(), previousKnownBalance.String())
+	} else {
+		// Relevant currency NOT in the specific update event.
+		// This means this particular event didn't change our relevant currency, or the update is for another asset.
+		// We must fetch the current absolute balance for the relevant currency to check for deposits.
+		log.Debugf("[%s] Relevant currency %s not in this specific balance update event. Fetching full balance for %s to check for potential deposit.", s.Symbol, relevantCurrency, relevantCurrency)
+		accountBalances := s.session.GetAccount().Balances()
+		if actualBalance, found := accountBalances[relevantCurrency]; found {
+			currentAvailableBalance = actualBalance.Available
+			balanceSource = "full fetch"
+			log.Infof("[%s] Balance status for %s (from %s): Current Available: %s. Old Known (before this event): %s",
+				s.Symbol, relevantCurrency, balanceSource, currentAvailableBalance.String(), previousKnownBalance.String())
+		} else {
+			// Relevant currency not found even in full fetch. This is unexpected.
+			log.Warnf("[%s] Relevant currency %s not found in delta update NOR in full balance fetch. Last known balance %s remains unchanged. Cannot check for deposit against current state.",
+				s.Symbol, relevantCurrency, previousKnownBalance.String())
+			// s.lastKnownRelevantBalance remains 'previousKnownBalance'. No change can be asserted.
+			return
 		}
-		return
 	}
 
-	log.Infof("[%s] Balance update for %s: Old Known: %s, New Available in Update: %s", s.Symbol, relevantCurrency, s.lastKnownRelevantBalance.String(), newBalance.Available.String())
+	// Now, compare currentAvailableBalance (from delta or full fetch) with previousKnownBalance
+	comparisonResult := currentAvailableBalance.Compare(previousKnownBalance)
 
-	// Check if the available balance for the relevant currency has increased
-	if newBalance.Available.Compare(s.lastKnownRelevantBalance) > 0 {
-		log.Infof("[%s] Detected deposit for %s. New available balance: %s (was %s). Attempting to place order.",
-			s.Symbol, relevantCurrency, newBalance.Available.String(), s.lastKnownRelevantBalance.String())
+	if comparisonResult > 0 {
+		log.Infof("[%s] Detected deposit for %s (balance source: %s). New available balance: %s (was %s). Attempting to place order.",
+			s.Symbol, relevantCurrency, balanceSource, currentAvailableBalance.String(), previousKnownBalance.String())
 
 		// Update lastKnownRelevantBalance before trying to place order
-		s.lastKnownRelevantBalance = newBalance.Available
+		s.lastKnownRelevantBalance = currentAvailableBalance
 
 		if err := s.placeOrder(ctx); err != nil {
 			log.WithError(err).Errorf("[%s] Error placing order after balance update: %v", s.Symbol, err)
@@ -331,13 +370,22 @@ func (s *Strategy) handleBalanceUpdate(ctx context.Context, updatedBalances type
 			log.Infof("[%s] Order placement attempt after balance update completed.", s.Symbol)
 			s.lastUpdateTime = time.Now() // Reset interval timer as we've just acted
 		}
-	} else if newBalance.Available.Compare(s.lastKnownRelevantBalance) < 0 {
-		log.Infof("[%s] Balance for %s decreased or stayed the same. New available: %s (was %s). No deposit detected.",
-			s.Symbol, relevantCurrency, newBalance.Available.String(), s.lastKnownRelevantBalance.String())
-		// Update lastKnownRelevantBalance even if it decreased or stayed same
-		s.lastKnownRelevantBalance = newBalance.Available
-	} else {
-		// Balance is the same, no action needed, but update lastKnownRelevantBalance just in case (should be redundant if logic is correct)
-		s.lastKnownRelevantBalance = newBalance.Available
+	} else { // Balance decreased or stayed the same
+		if comparisonResult < 0 {
+			log.Infof("[%s] Balance for %s decreased (balance source: %s). New available: %s (was %s).",
+				s.Symbol, relevantCurrency, balanceSource, currentAvailableBalance.String(), previousKnownBalance.String())
+		} else { // comparisonResult == 0
+			// Only log if the balance came from a delta update and was the same, or for verbosity on full fetch.
+			// Avoid spamming logs if balance is checked via full fetch and hasn't changed.
+			if foundRelevantBalanceInUpdate {
+				log.Infof("[%s] Balance for %s unchanged via %s. Available: %s.",
+					s.Symbol, relevantCurrency, balanceSource, currentAvailableBalance.String())
+			} else {
+				log.Debugf("[%s] Balance for %s confirmed unchanged via %s. Available: %s. No deposit detected.",
+					s.Symbol, relevantCurrency, balanceSource, currentAvailableBalance.String())
+			}
+		}
+		// Always update lastKnownRelevantBalance to the latest confirmed state
+		s.lastKnownRelevantBalance = currentAvailableBalance
 	}
 }
