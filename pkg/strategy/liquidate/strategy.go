@@ -32,12 +32,13 @@ type Strategy struct {
 	Market   types.Market
 	Position *types.Position
 
-	session                 *bbgo.ExchangeSession
-	orderExecutor           *bbgo.GeneralOrderExecutor
-	orderBook               *types.StreamOrderBook
-	lastUpdateTime          time.Time
-	lastCalculatedSellPrice fixedpoint.Value // Stores the last sell price that passed the drop check
-	maxPriceDropF           fixedpoint.Value // Parsed MaxPriceDropPercentage as fixedpoint
+	session                  *bbgo.ExchangeSession
+	orderExecutor            *bbgo.GeneralOrderExecutor
+	orderBook                *types.StreamOrderBook
+	lastUpdateTime           time.Time
+	lastCalculatedSellPrice  fixedpoint.Value // Stores the last sell price that passed the drop check
+	maxPriceDropF            fixedpoint.Value // Parsed MaxPriceDropPercentage as fixedpoint
+	lastKnownRelevantBalance fixedpoint.Value
 }
 
 func (s *Strategy) ID() string {
@@ -228,6 +229,9 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	}
 	s.Market = market
 
+	// Initialize lastKnownRelevantBalance
+	s.initializeLastKnownRelevantBalance()
+
 	// Initialize MaxPriceDropPercentage fixedpoint value
 	if s.MaxPriceDropPercentage > 0 && s.MaxPriceDropPercentage < 1.0 { // Basic validation e.g. 0.01 for 1%, 0.99 for 99%
 		s.maxPriceDropF = fixedpoint.NewFromFloat(s.MaxPriceDropPercentage)
@@ -248,6 +252,24 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 		}
 	})
 
+	// Subscribe to balance updates
+	if !s.session.PublicOnly {
+		s.session.UserDataStream.OnBalanceUpdate(func(balances types.BalanceMap) {
+			s.handleBalanceUpdate(ctx, balances)
+		})
+		// Also handle initial balance snapshot if needed, or rely on first balance update.
+		// For immediate action on startup after deposit, checking current balance and placing order
+		// if conditions met could be done here or after initial lastKnownRelevantBalance setup.
+		// Let's ensure placeOrder is attempted once if conditions are met after initialization.
+		log.Infof("[%s] Performing initial check for order placement potential after setup.", s.Symbol)
+		if err := s.placeOrder(ctx); err != nil {
+			log.WithError(err).Errorf("[%s] Error during initial order placement check: %v", s.Symbol, err)
+		} else {
+			// if placeOrder was successful (or skipped appropriately), update time
+			s.lastUpdateTime = time.Now()
+		}
+	}
+
 	// the shutdown handler, you can cancel all orders
 	bbgo.OnShutdown(ctx, func(ctx context.Context, wg *sync.WaitGroup) {
 		defer wg.Done()
@@ -256,4 +278,66 @@ func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, se
 	})
 
 	return nil
+}
+
+func (s *Strategy) initializeLastKnownRelevantBalance() {
+	balances := s.session.GetAccount().Balances()
+	relevantCurrency := s.Market.QuoteCurrency // Default for BUY side
+	if s.Side == "SELL" {
+		relevantCurrency = s.Market.BaseCurrency
+	}
+
+	if balance, ok := balances[relevantCurrency]; ok {
+		s.lastKnownRelevantBalance = balance.Available
+		log.Infof("[%s] Initialized lastKnownRelevantBalance for %s: %s", s.Symbol, relevantCurrency, s.lastKnownRelevantBalance.String())
+	} else {
+		s.lastKnownRelevantBalance = fixedpoint.Zero
+		log.Warnf("[%s] Could not find initial balance for %s. lastKnownRelevantBalance set to 0.", s.Symbol, relevantCurrency)
+	}
+}
+
+func (s *Strategy) handleBalanceUpdate(ctx context.Context, updatedBalances types.BalanceMap) {
+	relevantCurrency := s.Market.QuoteCurrency // Default for BUY side
+	if s.Side == "SELL" {
+		relevantCurrency = s.Market.BaseCurrency
+	}
+
+	newBalance, ok := updatedBalances[relevantCurrency]
+	if !ok {
+		// log.Debugf("[%s] Balance update received, but relevant currency %s not found in the update.", s.Symbol, relevantCurrency)
+		// We should still update our knowledge of other balances if they affect overall account state.
+		// However, for triggering based on a specific currency deposit, we only care about that one.
+		// Let's re-fetch the full balances to update our lastKnownRelevantBalance accurately.
+		currentBalances := s.session.GetAccount().Balances()
+		if currentRelBalance, ok := currentBalances[relevantCurrency]; ok {
+			s.lastKnownRelevantBalance = currentRelBalance.Available
+		}
+		return
+	}
+
+	log.Infof("[%s] Balance update for %s: Old Known: %s, New Available in Update: %s", s.Symbol, relevantCurrency, s.lastKnownRelevantBalance.String(), newBalance.Available.String())
+
+	// Check if the available balance for the relevant currency has increased
+	if newBalance.Available.Compare(s.lastKnownRelevantBalance) > 0 {
+		log.Infof("[%s] Detected deposit for %s. New available balance: %s (was %s). Attempting to place order.",
+			s.Symbol, relevantCurrency, newBalance.Available.String(), s.lastKnownRelevantBalance.String())
+
+		// Update lastKnownRelevantBalance before trying to place order
+		s.lastKnownRelevantBalance = newBalance.Available
+
+		if err := s.placeOrder(ctx); err != nil {
+			log.WithError(err).Errorf("[%s] Error placing order after balance update: %v", s.Symbol, err)
+		} else {
+			log.Infof("[%s] Order placement attempt after balance update completed.", s.Symbol)
+			s.lastUpdateTime = time.Now() // Reset interval timer as we've just acted
+		}
+	} else if newBalance.Available.Compare(s.lastKnownRelevantBalance) < 0 {
+		log.Infof("[%s] Balance for %s decreased or stayed the same. New available: %s (was %s). No deposit detected.",
+			s.Symbol, relevantCurrency, newBalance.Available.String(), s.lastKnownRelevantBalance.String())
+		// Update lastKnownRelevantBalance even if it decreased or stayed same
+		s.lastKnownRelevantBalance = newBalance.Available
+	} else {
+		// Balance is the same, no action needed, but update lastKnownRelevantBalance just in case (should be redundant if logic is correct)
+		s.lastKnownRelevantBalance = newBalance.Available
+	}
 }
