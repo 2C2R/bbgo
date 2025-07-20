@@ -2,7 +2,7 @@
 
 module github.com/c9s/bbgo
 
-go 1.23
+go 1.23.0
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
@@ -55,7 +55,7 @@ require (
 	github.com/zserge/lorca v0.1.9
 	go.uber.org/mock v0.4.0
 	go.uber.org/multierr v1.11.0
-	golang.org/x/oauth2 v0.22.0
+	golang.org/x/oauth2 v0.27.0
 	golang.org/x/sync v0.9.0
 	golang.org/x/time v0.6.0
 	gonum.org/v1/gonum v0.8.2
