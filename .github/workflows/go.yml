@@ -3,11 +3,11 @@ name: Go
 on:
   push:
     branches:
-    - "main"
+    - "2c2r/main"
   pull_request:
     # types: [synchronize, opened, reopened]
     branches:
-    - "main"
+    - "2c2r/main"
     - "v*"
 
 jobs:
