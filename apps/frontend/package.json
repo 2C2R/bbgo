@@ -22,7 +22,7 @@
     "@nivo/core": "^0.79.0",
     "@nivo/pie": "^0.79.1",
     "@usedapp/core": "1.0.9",
-    "axios": "^0.27.2",
+    "axios": "^0.30.2",
     "classnames": "^2.2.6",
     "ethers": "^5.6.9",
     "isomorphic-fetch": "^3.0.0",
